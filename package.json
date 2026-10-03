@@ -1,0 +1,15 @@
+{
+  "name": "offline-instruction-auth-review",
+  "version": "1.0.0",
+  "private": true,
+  "description": "地面审查：离线指令授权快照 Merkle Patricia Trie 证明核验",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node test/run-all.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
