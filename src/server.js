@@ -1,11 +1,14 @@
 'use strict';
 // 零依赖 HTTP 服务：
-//   GET  /            静态导入入口页
-//   GET  /healthz     健康检查 -> 200 {"status":"ok"}
-//   POST /api/verify  证明核验（JSON 入参，返回 {result, page}）
+//   GET  /                  静态导入入口页（含单指令与批量两种表单）
+//   GET  /healthz           健康检查 -> 200 {"status":"ok"}
+//   POST /api/verify        单指令证明核验（JSON 入参，返回 {result, page}）
+//   POST /api/verify-batch  同快照 2–8 条指令的批量核验（共用去重节点池）
+//   GET  /api/sample        单指令示例快照
+//   GET  /api/sample-batch  批量示例（根哈希 + 多条标识 + 去重节点池）
 // 宿主端口可经环境变量 PORT / HOST 配置。
 const http = require('node:http');
-const { handleVerify } = require('./verify-api');
+const { handleVerify, handleVerifyBatch } = require('./verify-api');
 const { buildIndexPage } = require('./page');
 const { buildSnapshots } = require('./sample-snapshot');
 const { toHex } = require('./hexutil');
@@ -26,6 +29,24 @@ function samplePayload() {
   };
 }
 
+// 批量示例：同一快照的 5 条标识覆盖 已授权/未授权/无效 三类结论；
+// 节点池取整棵已提交树的去重节点集合，含若干目标路径用不到的冗余证据。
+function sampleBatchPayload() {
+  const snap = buildSnapshots();
+  const keyHexes = [
+    snap.keys.authorized, // 长键：已授权
+    snap.keys.unauthorized, // 长键兄弟：未授权
+    snap.keys.otherAuthorized, // 短键内嵌叶：已授权
+    snap.keys.shortUnauthorized, // 短键：未授权
+    'a3', // 树中不存在：分支空槽 -> 该条无效，不影响其余条目
+  ];
+  const poolNodes = [];
+  for (const node of snap.trie.table.values()) {
+    poolNodes.push(toHex(node.encoded));
+  }
+  return { rootHash: snap.rootHashHex, keyHexes, poolNodes };
+}
+
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
@@ -41,6 +62,30 @@ function sendHtml(res, status, html) {
     'Content-Length': Buffer.byteLength(html),
   });
   res.end(html);
+}
+
+function readJsonBody(req, res, done) {
+  const chunks = [];
+  let size = 0;
+  req.on('data', (c) => {
+    size += c.length;
+    if (size > 2 * 1024 * 1024) {
+      sendJson(res, 413, { error: '请求体超过 2 MiB 限制' });
+      req.destroy();
+      return;
+    }
+    chunks.push(c);
+  });
+  req.on('end', () => {
+    let body;
+    try {
+      body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+    } catch (e) {
+      sendJson(res, 400, { error: `JSON 请求体解析失败：${e.message}` });
+      return;
+    }
+    done(body);
+  });
 }
 
 function createServer() {
@@ -61,30 +106,24 @@ function createServer() {
       return sendJson(res, 200, samplePayload());
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/sample-batch') {
+      return sendJson(res, 200, sampleBatchPayload());
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/verify') {
-      const chunks = [];
-      let size = 0;
-      req.on('data', (c) => {
-        size += c.length;
-        if (size > 2 * 1024 * 1024) {
-          sendJson(res, 413, { error: '请求体超过 2 MiB 限制' });
-          req.destroy();
-          return;
-        }
-        chunks.push(c);
-      });
-      req.on('end', () => {
-        let body;
-        try {
-          body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
-        } catch (e) {
-          return sendJson(res, 400, { error: `JSON 请求体解析失败：${e.message}` });
-        }
+      return readJsonBody(req, res, (body) => {
         const out = handleVerify(body);
         if (out.error) return sendJson(res, out.httpStatus, { error: out.error });
         sendJson(res, 200, { result: out.result, page: out.page });
       });
-      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/verify-batch') {
+      return readJsonBody(req, res, (body) => {
+        const out = handleVerifyBatch(body);
+        if (out.error) return sendJson(res, out.httpStatus, { error: out.error });
+        sendJson(res, 200, { result: out.result, page: out.page });
+      });
     }
 
     sendJson(res, 404, { error: '未找到该路径' });

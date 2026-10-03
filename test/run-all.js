@@ -3,9 +3,9 @@
 // 穿插运行 证明内核校验 / 结果页构建检查 / API 与 HTTP（含健康端点）冒烟。
 const { createHarness, assert } = require('./harness');
 const { buildSnapshots } = require('./fixtures');
-const { verifyProof } = require('../src/verifier');
-const { handleVerify, parseProofNodes } = require('../src/verify-api');
-const { buildResultPage, buildIndexPage } = require('../src/page');
+const { verifyProof, verifyProofFromPool, verifyBatch, dedupePool } = require('../src/verifier');
+const { handleVerify, handleVerifyBatch, parseProofNodes, parseKeyHexes } = require('../src/verify-api');
+const { buildResultPage, buildBatchPage, buildIndexPage } = require('../src/page');
 const { createServer } = require('../src/server');
 const { keccak256 } = require('../src/keccak');
 const rlp = require('../src/rlp');
@@ -117,6 +117,13 @@ async function main() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ rootHash, keyHex, proofNodes: nodesText }),
+    });
+
+  const postVerifyBatch = async (rootHash, keyHexes, poolText) =>
+    http('/api/verify-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rootHash, keyHexes, proofNodes: poolText }),
     });
 
   // ========== 场景一：有效授权（叶值 01）==========
@@ -453,6 +460,324 @@ async function main() {
     test('证明内核：32 字节根哈希以外的输入被拒绝', () => {
       a.equal(verifyProof(U(1, 2, 3), [1], proofAuth).code, 'BAD_ROOT');
       a.equal(verifyProof(snap.rootHash, [1, 99], proofAuth).code, 'BAD_KEY');
+    });
+  });
+
+  // ========== 批量复核：去重节点池 + 多标识独立核验 ==========
+  await suite('批量复核（节点池 / 独立追随 / 共享复用 / 冗余证据 / 失败隔离）').run(async () => {
+    const fullPool = Array.from(new Map(snap.trie.table).values()).map((n) => n.encoded);
+    const entryFor = (keyHex) => {
+      try {
+        return { keyHex, nibbles: Array.from(keyHex, (c) => parseInt(c, 16)), parseError: null };
+      } catch (e) {
+        return { keyHex, nibbles: null, parseError: e.message };
+      }
+    };
+    const batchFor = (keyHexes, pool = fullPool) => verifyBatch(snap.rootHash, keyHexes.map(entryFor), dedupePool(pool).nodes);
+
+    test('内核：多条标识逐条得出 authorized/unauthorized/invalid 且路径各自完整', () => {
+      const batch = batchFor([keyAuth, keyNo, snap.keys.otherAuthorized, snap.keys.shortUnauthorized, 'a3']);
+      a.deepEqual(batch.summary, { authorized: 2, unauthorized: 2, invalid: 1 });
+      a.equal(batch.results[0].status, 'authorized');
+      a.equal(batch.results[0].consumedPath, keyAuth);
+      a.equal(batch.results[1].status, 'unauthorized');
+      a.equal(batch.results[1].consumedPath, keyNo);
+      a.equal(batch.results[2].status, 'authorized');
+      a.equal(batch.results[2].consumedPath, 'a2');
+      a.equal(batch.results[3].status, 'unauthorized');
+      a.equal(batch.results[4].status, 'invalid');
+      a.equal(batch.results[4].code, 'PATH_INCOMPLETE');
+      a.equal(batch.results[4].consumedPath, 'a');
+    });
+
+    test('内核：共享前缀节点被标出复用次数与对应指令（散列引用）', () => {
+      const batch = batchFor([keyAuth, keyNo]);
+      const rootEntry = batch.reuse.find((e) => e.nodeHash === snap.rootHashHex);
+      a.ok(rootEntry, '根节点必须出现在复用表');
+      a.equal(rootEntry.reuseCount, 2);
+      a.deepEqual(rootEntry.keyIndexes, [0, 1]);
+      // 两条长键兄弟共享至少 4 个前缀节点（根分支 + 扩展链）
+      a.ok(batch.reuse.length >= 4, `共享节点数应 >= 4，实际 ${batch.reuse.length}`);
+      for (const e of batch.reuse) a.deepEqual(e.keyIndexes, [0, 1]);
+    });
+
+    test('内核：同一内嵌叶经两条路径以 embedded-node 方式复用也被标出', () => {
+      // 长键家族与短键 a2 都内嵌同一 3 字节叶 RLP（hp=20,value=01），摘要相同。
+      const batch = batchFor([keyAuth, snap.keys.otherAuthorized]);
+      const sharedLeaf = batch.results[0].layers[batch.results[0].layers.length - 1];
+      const reuseEntry = batch.reuse.find((e) => e.nodeHash === sharedLeaf.nodeHash);
+      a.ok(reuseEntry, '同摘要内嵌叶应计入复用');
+      a.equal(reuseEntry.reuseCount, 2);
+      a.deepEqual(reuseEntry.modes, ['embedded-node', 'embedded-node']);
+      // 表中同时存在独立池条目，但两条路径均经由父节点内嵌内容抵达
+      a.equal(reuseEntry.inPool, true);
+    });
+
+    test('内核：短键兄弟共享的内嵌分支同样计入复用，根为散列/根形态', () => {
+      const batch = batchFor([snap.keys.otherAuthorized, snap.keys.shortUnauthorized]);
+      const rootEntry = batch.reuse.find((e) => e.nodeHash === snap.rootHashHex);
+      a.equal(rootEntry.reuseCount, 2);
+      a.deepEqual(rootEntry.modes, ['hash-32', 'hash-32']); // 根承诺归入散列/根形态
+      const embeddedShared = batch.reuse.filter((e) => e.modes.every((m) => m === 'embedded-node'));
+      a.ok(embeddedShared.length >= 1, '至少一个共享节点由两条路径以内嵌方式抵达');
+    });
+
+    test('内核：一条路径缺失散列引用只判该条无效，同批其余指令照常授权', () => {
+      // 删除长键路径第 2 个节点（根分支槽 0 指向的扩展），池其余节点保留。
+      const missingHash = toHex(keccak256(proofAuth[1]));
+      const pool = fullPool.filter((b) => toHex(keccak256(b)) !== missingHash);
+      const batch = batchFor([keyAuth, keyNo, snap.keys.otherAuthorized], pool);
+      a.equal(batch.results[0].status, 'invalid');
+      a.equal(batch.results[0].code, 'PATH_INCOMPLETE');
+      a.equal(batch.results[0].firstFailedLayer, 2);
+      a.equal(batch.results[1].status, 'invalid');
+      a.equal(batch.results[1].firstFailedLayer, 2);
+      a.equal(batch.results[2].status, 'authorized', '短键 a2 路径不经过缺失节点，必须照常授权');
+    });
+
+    test('内核：路径偏离（分支空槽）只影响该条，兄弟条目结论与层数不受影响', () => {
+      const batch = batchFor([snap.keys.otherAuthorized, 'a3', 'a9', snap.keys.shortUnauthorized]);
+      a.equal(batch.results[0].status, 'authorized');
+      a.equal(batch.results[1].status, 'invalid');
+      a.equal(batch.results[1].code, 'PATH_INCOMPLETE');
+      a.equal(batch.results[2].code, 'PATH_INCOMPLETE');
+      a.equal(batch.results[3].status, 'unauthorized');
+      a.equal(batch.results[0].layers.length, 3);
+      a.equal(batch.results[3].layers.length, 3);
+    });
+
+    test('内核：无法解析的标识按条隔离为 BAD_KEY，不阻断其余条目', () => {
+      const batch = verifyBatch(
+        snap.rootHash,
+        [
+          { keyHex: 'a2g', nibbles: null, parseError: '含有非十六进制字符' },
+          entryFor(snap.keys.otherAuthorized),
+        ],
+        dedupePool(fullPool).nodes
+      );
+      a.equal(batch.results[0].status, 'invalid');
+      a.equal(batch.results[0].code, 'BAD_KEY');
+      a.equal(batch.results[0].firstFailedLayer, 0);
+      a.equal(batch.results[1].status, 'authorized');
+    });
+
+    test('内核：池中不可达的非规范 RLP 节点列为冗余证据，不影响任何结论', () => {
+      const junk = B('8100'); // 非规范单字节长形式，且其摘要不会被任何规范父节点引用
+      const pool = dedupePool(fullPool.concat([junk])).nodes;
+      const batch = verifyBatch(snap.rootHash, [entryFor(keyAuth), entryFor('a2')], pool);
+      a.equal(batch.results[0].status, 'authorized');
+      a.equal(batch.results[1].status, 'authorized');
+      const junkEntry = batch.redundant.find((n) => n.nodeHash === toHex(keccak256(junk)));
+      a.ok(junkEntry, '不可达的非规范节点必须出现在冗余证据中');
+      a.equal(junkEntry.kind, 'unparseable');
+    });
+
+    test('内核：实际抵达的非规范散列子节点只令追随它的那条指令无效', () => {
+      // 手工构造规范分支根：槽 3 引用一个非规范节点 X 的散列；槽 5 内嵌合法授权叶。
+      const x = B('8100');
+      const xHash = keccak256(x);
+      const slots = new Array(17).fill(U());
+      slots[3] = xHash;
+      slots[5] = [B('20'), U(0x01)]; // 内嵌叶：HP 空剩余路径 + 值 01
+      const rootBytes = rlp.encode(slots);
+      const pool = [rootBytes, x];
+      const batch = verifyBatch(
+        keccak256(rootBytes),
+        [entryFor('5'), entryFor('3')],
+        pool
+      );
+      a.equal(batch.results[0].status, 'authorized');
+      a.equal(batch.results[0].value, '01');
+      a.equal(batch.results[1].status, 'invalid');
+      a.equal(batch.results[1].code, 'RLP_NONCANONICAL');
+      a.equal(batch.results[1].firstFailedLayer, 2);
+    });
+
+    test('内核：节点池不要求顺序，打乱后各条结论与复用表完全一致', () => {
+      const shuffled = fullPool.map((b) => b).reverse();
+      const a1 = batchFor([keyAuth, keyNo, 'a2']);
+      const a2 = batchFor([keyAuth, keyNo, 'a2'], shuffled);
+      a.deepEqual(a2.summary, a1.summary);
+      a.deepEqual(a2.results.map((r) => [r.status, r.code, r.consumedPath]),
+        a1.results.map((r) => [r.status, r.code, r.consumedPath]));
+      a.deepEqual(a2.reuse.map((e) => e.nodeHash).sort(), a1.reuse.map((e) => e.nodeHash).sort());
+    });
+
+    test('内核：池模式不因叶后多余节点报 TAIL_DUPLICATE；多余节点成为冗余证据', () => {
+      // 整池 + 目标键本身允许存在未消费节点（与单指令有序模式不同）。
+      const batch = batchFor([snap.keys.otherAuthorized]);
+      a.notEqual(batch.results[0].code, 'TAIL_DUPLICATE');
+      a.ok(batch.redundant.length > 0, '未被短键路径消费的池节点应列为冗余');
+    });
+
+    test('内核：池节点只能由引用实际抵达——无人引用的合法叶节点是冗余证据', () => {
+      const orphan = rlp.encode([hp.encode([9, 9], true), U(0x09)]); // 合法叶但无任何父节点指向
+      const pool = dedupePool(fullPool.concat([orphan])).nodes;
+      const batch = verifyBatch(snap.rootHash, [entryFor('a2')], pool);
+      a.equal(batch.results[0].status, 'authorized');
+      const orphanEntry = batch.redundant.find((n) => n.nodeHash === toHex(keccak256(orphan)));
+      a.ok(orphanEntry);
+      a.equal(orphanEntry.kind, 'leaf');
+    });
+
+    test('内核：根哈希不在池中 -> 各条 ROOT_MISMATCH（第 1 层）', () => {
+      const wrong = Uint8Array.from(snap.rootHash);
+      wrong[0] ^= 0xff;
+      const batch = verifyBatch(wrong, [entryFor(keyAuth), entryFor('a2')], dedupePool(fullPool).nodes);
+      for (const r of batch.results) {
+        a.equal(r.status, 'invalid');
+        a.equal(r.code, 'ROOT_MISMATCH');
+        a.equal(r.firstFailedLayer, 1);
+      }
+    });
+
+    test('内核：dedupePool 按摘要剔除重复节点并计数', () => {
+      const dup = fullPool.concat([fullPool[0], fullPool[1], fullPool[0]]);
+      const { nodes, duplicates } = dedupePool(dup);
+      a.equal(duplicates, 3);
+      a.equal(nodes.length, fullPool.length);
+    });
+
+    test('内核：verifyProofFromPool 与单指令 verifyProof 在同一有序证明上结论一致', () => {
+      for (const [key, proof] of [[keyAuth, proofAuth], [keyNo, proofNo]]) {
+        const single = verifyProof(snap.rootHash, bytesToNibbles(fromHex(key)), proof);
+        const pooled = verifyProofFromPool(snap.rootHash, bytesToNibbles(fromHex(key)), proof);
+        a.equal(pooled.status, single.status);
+        a.equal(pooled.code, single.code);
+        a.equal(pooled.consumedPath, single.consumedPath);
+        a.equal(pooled.layers.length, single.layers.length);
+      }
+    });
+
+    test('页面：批量页含汇总横幅/逐条结论/各自消费路径', () => {
+      const batch = batchFor([keyAuth, keyNo, 'a3']);
+      const page = buildBatchPage(batch, { rootHash: snap.rootHashHex, submittedPoolSize: fullPool.length, duplicates: 0 });
+      a.match(page, /<title>离线指令授权快照批量复核结果<\/title>/);
+      a.match(page, /已授权 1 条 · 未授权 1 条 · 无效 1 条/);
+      a.match(page, new RegExp(keyAuth));
+      a.match(page, new RegExp(keyNo));
+      a.match(page, /仅清除本条旧结论/);
+      a.match(page, /完整已消费半字节路径/);
+      // 失败条显示首个失败层，成功条显示已授权
+      a.match(page, /PATH_INCOMPLETE/);
+      a.ok(page.includes('banner-title">指令 1 · 已授权'));
+    });
+
+    test('页面：共享节点表列出复用次数与对应指令，冗余证据单独成节', () => {
+      const batch = batchFor([keyAuth, keyNo, 'a2']);
+      const page = buildBatchPage(batch, { rootHash: snap.rootHashHex, submittedPoolSize: fullPool.length, duplicates: 0 });
+      a.match(page, /共享节点复用/);
+      a.match(page, /复用次数/);
+      a.match(page, /2 次/);
+      a.match(page, /冗余证据/);
+      a.ok(batch.redundant.length > 0);
+      for (const n of batch.redundant) a.match(page, new RegExp(n.nodeHash.slice(0, 16)));
+      a.match(page, /内嵌|散列/);
+    });
+
+    test('页面：去重统计在元信息区呈现，HTML 内容做转义', () => {
+      const dup = fullPool.concat([fullPool[0]]);
+      const batch = verifyBatch(snap.rootHash, [entryFor(keyAuth), entryFor('a2')], dedupePool(dup).nodes);
+      batch.deduplicated = 1;
+      const page = buildBatchPage(batch, { rootHash: snap.rootHashHex, submittedPoolSize: dup.length, duplicates: 1 });
+      a.match(page, /提交 \d+ 个，去重后 \d+ 个（剔除 1 个重复节点）/);
+      a.ok(!page.includes('<script>'));
+    });
+
+    test('API：合法批量提交 200，结果与页面齐备', () => {
+      const out = handleVerifyBatch({
+        rootHash: snap.rootHashHex,
+        keyHexes: [keyAuth, keyNo, 'a2'],
+        proofNodes: fullPool.map((b) => toHex(b)).join('\n'),
+      });
+      a.equal(out.httpStatus, 200);
+      a.deepEqual(out.result.summary, { authorized: 2, unauthorized: 1, invalid: 0 });
+      a.equal(out.result.poolSize, fullPool.length);
+      a.match(out.page, /批量结论/);
+    });
+
+    test('API：重复粘贴的共同前缀节点被去重并计数', () => {
+      const nodes = fullPool.concat([fullPool[0], fullPool[2]]);
+      const out = handleVerifyBatch({
+        rootHash: snap.rootHashHex,
+        keyHexes: ['a2', 'a1'],
+        proofNodes: nodes.map((b) => toHex(b)),
+      });
+      a.equal(out.httpStatus, 200);
+      a.equal(out.result.deduplicated, 2);
+      a.equal(out.result.submittedPoolSize, nodes.length);
+      a.equal(out.result.poolSize, fullPool.length);
+      a.deepEqual(out.result.summary, { authorized: 1, unauthorized: 1, invalid: 0 });
+    });
+
+    test('API：标识数 1 条或超过 8 条均 400，2 至 8 条接受', () => {
+      const nodes = fullPool.map((b) => toHex(b));
+      const mk = (hexes) => handleVerifyBatch({ rootHash: snap.rootHashHex, keyHexes: hexes, proofNodes: nodes });
+      a.equal(mk(['a2']).httpStatus, 400);
+      a.match(mk(['a2']).error, /2 至 8/);
+      const nine = Array.from({ length: 9 }, (_, i) => `0${i}`);
+      a.equal(mk(nine).httpStatus, 400);
+      a.match(mk(nine).error, /最多 8 条/);
+      const two = mk(['a2', 'a1']);
+      a.equal(two.httpStatus, 200);
+    });
+
+    test('API：keyHexes 支持换行/逗号文本与 JSON 数组两种形式', () => {
+      a.deepEqual(parseKeyHexes('a2\na1\n01'), ['a2', 'a1', '01']);
+      a.deepEqual(parseKeyHexes('a2, a1;01'), ['a2', 'a1', '01']);
+      a.deepEqual(parseKeyHexes(['0xAB', 'cd']), ['0xAB', 'cd']);
+      a.throws(() => parseKeyHexes('only'), /2 至 8/);
+    });
+
+    test('API：批量中单条坏标识不影响整批 HTTP 200 与其他条目', () => {
+      const out = handleVerifyBatch({
+        rootHash: snap.rootHashHex,
+        keyHexes: 'a2\nzzz\na1',
+        proofNodes: fullPool.map((b) => toHex(b)),
+      });
+      a.equal(out.httpStatus, 200);
+      a.equal(out.result.results[0].status, 'authorized');
+      a.equal(out.result.results[1].status, 'invalid');
+      a.equal(out.result.results[1].code, 'BAD_KEY');
+      a.equal(out.result.results[2].status, 'unauthorized');
+    });
+
+    test('API：根哈希长度错误等提交级问题返回 400', () => {
+      const out = handleVerifyBatch({ rootHash: '0102', keyHexes: ['a2', 'a1'], proofNodes: '80' });
+      a.equal(out.httpStatus, 400);
+      a.match(out.error, /32 字节/);
+    });
+
+    test('入口页：含批量表单、去重节点池说明与 2–8 条限制', () => {
+      const html = buildIndexPage();
+      a.match(html, /id="batch-form"/);
+      a.match(html, /name="keyHexes"/);
+      a.match(html, /去重 RLP 节点池/);
+      a.match(html, /2 至 8/);
+      a.match(html, /\/api\/verify-batch/);
+    });
+
+    test('HTTP 冒烟：GET /api/sample-batch 返回根哈希/多条标识/节点池', async () => {
+      const res = await http('/api/sample-batch');
+      a.equal(res.status, 200);
+      const data = await res.json();
+      a.match(data.rootHash, /^[0-9a-f]{64}$/);
+      a.ok(data.keyHexes.length >= 2 && data.keyHexes.length <= 8);
+      a.ok(data.poolNodes.length >= data.keyHexes.length);
+      // 示例池至少含一个任何示例路径都不消费的冗余节点
+    });
+
+    test('HTTP 冒烟：POST /api/verify-batch 返回三类结论并存的批量页', async () => {
+      const sample = await (await http('/api/sample-batch')).json();
+      const res = await postVerifyBatch(sample.rootHash, sample.keyHexes, sample.poolNodes.join('\n'));
+      a.equal(res.status, 200);
+      const data = await res.json();
+      a.equal(data.result.kind, 'batch');
+      a.ok(data.result.summary.authorized >= 1);
+      a.ok(data.result.summary.invalid >= 1, '示例中 a3 应为无效条目');
+      a.match(data.page, /批量结论/);
+      a.match(data.page, /共享节点复用/);
+      a.match(data.page, /冗余证据/);
     });
   });
 

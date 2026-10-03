@@ -116,6 +116,57 @@ async function main() {
     no.json.result.value === '00' && no.json.result.layers.length > 0);
   check('未授权页明确显示“未授权”', no.json.page.includes('未授权'));
 
+  // 批量：同一快照多条标识 + 去重节点池
+  const batchSampleRes = await fetch(BASE + '/api/sample-batch');
+  check('GET /api/sample-batch 返回 200', batchSampleRes.status === 200);
+  const batchSample = await batchSampleRes.json();
+  check('批量示例含根哈希、2..8 条标识与节点池',
+    /^[0-9a-f]{64}$/.test(batchSample.rootHash) &&
+    Array.isArray(batchSample.keyHexes) && batchSample.keyHexes.length >= 2 &&
+    batchSample.keyHexes.length <= 8 && Array.isArray(batchSample.poolNodes) &&
+    batchSample.poolNodes.length >= 2);
+
+  const batch = await postJson('/api/verify-batch', {
+    rootHash: batchSample.rootHash,
+    keyHexes: batchSample.keyHexes,
+    proofNodes: batchSample.poolNodes.join('\n'),
+  });
+  check('批量核验：HTTP 200 且逐条结论齐全',
+    batch.status === 200 && batch.json.result && batch.json.result.kind === 'batch' &&
+    batch.json.result.results.length === batchSample.keyHexes.length);
+  check('批量核验：已授权/未授权/无效三类结论并存且失败隔离',
+    batch.json.result.summary.authorized >= 1 &&
+    batch.json.result.summary.unauthorized >= 1 &&
+    batch.json.result.summary.invalid >= 1);
+  check('批量页含汇总/共享复用/冗余证据三节',
+    batch.json.page.includes('批量结论') &&
+    batch.json.page.includes('共享节点复用') &&
+    batch.json.page.includes('冗余证据'));
+  check('批量核验：共享前缀节点标出复用次数',
+    batch.json.result.reuse.some((e) => e.reuseCount >= 2));
+
+  // 批量输入边界：1 条拒绝、9 条拒绝、单条坏标识不影响其余条目
+  const tooFew = await postJson('/api/verify-batch', {
+    rootHash: batchSample.rootHash, keyHexes: ['a2'], proofNodes: batchSample.poolNodes.join('\n'),
+  });
+  check('批量仅 1 条标识 -> 400', tooFew.status === 400 && /2 至 8/.test(tooFew.json.error || ''));
+  const nine = ['00', '11', '22', '33', '44', '55', '66', '77', '88'];
+  const tooMany = await postJson('/api/verify-batch', {
+    rootHash: batchSample.rootHash, keyHexes: nine, proofNodes: batchSample.poolNodes.join('\n'),
+  });
+  check('批量 9 条标识 -> 400', tooMany.status === 400 && /最多 8 条/.test(tooMany.json.error || ''));
+  const oneBad = await postJson('/api/verify-batch', {
+    rootHash: batchSample.rootHash,
+    keyHexes: ['a2', 'zzz', 'a1'],
+    proofNodes: batchSample.poolNodes.concat(batchSample.poolNodes[0]).join('\n'),
+  });
+  check('批量中坏标识按条隔离且重复池节点被去重',
+    oneBad.status === 200 &&
+    oneBad.json.result.results[0].status === 'authorized' &&
+    oneBad.json.result.results[1].code === 'BAD_KEY' &&
+    oneBad.json.result.results[2].status === 'unauthorized' &&
+    oneBad.json.result.deduplicated === 1);
+
   console.log(`\nHTTP 冒烟：${failures === 0 ? '全部通过 ✅' : failures + ' 项失败'}`);
   process.exitCode = failures === 0 ? 0 : 1;
 }
