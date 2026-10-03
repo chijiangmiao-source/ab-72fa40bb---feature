@@ -2,10 +2,12 @@
 // 验收测试总入口：按「有效授权 → 篡改子节点引用 → 非规范 RLP」三大场景，
 // 穿插运行 证明内核校验 / 结果页构建检查 / API 与 HTTP（含健康端点）冒烟。
 const { createHarness, assert } = require('./harness');
-const { buildSnapshots } = require('./fixtures');
+const { buildSnapshots, buildBatchSample } = require('./fixtures');
 const { verifyProof } = require('../src/verifier');
-const { handleVerify, parseProofNodes } = require('../src/verify-api');
-const { buildResultPage, buildIndexPage } = require('../src/page');
+const { buildPool, verifyFromPool } = require('../src/pool-verifier');
+const { verifyBatch } = require('../src/batch');
+const { handleVerify, handleVerifyBatch, parseProofNodes, parseKeyHexes } = require('../src/verify-api');
+const { buildResultPage, buildBatchPage, buildIndexPage } = require('../src/page');
 const { createServer } = require('../src/server');
 const { keccak256 } = require('../src/keccak');
 const rlp = require('../src/rlp');
@@ -513,6 +515,227 @@ async function main() {
       const res = await http('/api/verify', { method: 'POST', body: '{not-json' });
       a.equal(res.status, 400);
       a.match((await res.json()).error, /JSON/);
+    });
+  });
+
+  // ========== 批量复核（共享去重节点池：内核 → 页面 → API → HTTP） ==========
+  await suite('批量复核：同快照多指令共享去重 RLP 节点池').run(async () => {
+    const keyFed = 'fedcba9876543210abcd';
+    const keyMissing = '0123456789abcdef0129'; // 不存在于树中
+    const unionNodes = [];
+    for (const k of [keyAuth, keyNo, snap.keys.otherAuthorized, keyFed]) {
+      for (const n of snap.proofFor(k)) unionNodes.push(n);
+    }
+
+    test('池内核：与顺序证明等价（authorized / unauthorized / 内嵌叶短键）', () => {
+      const pool = buildPool(unionNodes);
+      for (const [key, status, value] of [
+        [keyAuth, 'authorized', '01'],
+        [keyNo, 'unauthorized', '00'],
+        [snap.keys.otherAuthorized, 'authorized', '01'],
+        [keyFed, 'authorized', '01'],
+      ]) {
+        const r = verifyFromPool(snap.rootHash, bytesToNibbles(fromHex(key)), pool);
+        a.equal(r.status, status, `${key} 状态`);
+        a.equal(r.consumedPath, key, `${key} 已消费路径`);
+        if (value) a.equal(r.value, value);
+        a.equal(r.firstFailedLayer, null);
+      }
+    });
+
+    test('池内核：解析只接受摘要实际命中的池节点，且与提交顺序无关', () => {
+      const reversed = unionNodes.slice().reverse();
+      const pool = buildPool(reversed);
+      const r = verifyFromPool(snap.rootHash, bytesToNibbles(fromHex(keyAuth)), pool);
+      a.equal(r.status, 'authorized');
+      a.equal(r.consumedPath, keyAuth);
+      // reached 序列从根开始，第一个抵达节点必须是根（即使它排在池尾）
+      const rootEntry = pool.entries[r.reached[0]];
+      a.equal(rootEntry.hashHex, snap.rootHashHex);
+    });
+
+    test('池内核：重复粘贴的共同节点按摘要去重', () => {
+      const withDups = unionNodes.concat([unionNodes[0], unionNodes[0]]);
+      const pool = buildPool(withDups);
+      a.equal(pool.submittedCount, withDups.length);
+      a.ok(pool.entries.length < withDups.length);
+    });
+
+    test('池内核：根哈希在池中无对应节点 -> ROOT_MISMATCH 第 1 层', () => {
+      const pool = buildPool(unionNodes);
+      const wrong = Uint8Array.from(snap.rootHash);
+      wrong[0] ^= 0xff;
+      const r = verifyFromPool(wrong, bytesToNibbles(fromHex(keyAuth)), pool);
+      a.equal(r.code, 'ROOT_MISMATCH');
+      a.equal(r.firstFailedLayer, 1);
+      a.equal(r.reached.length, 0);
+    });
+
+    test('聚合：逐条结论正确，单条路径失败不影响同批其他指令', () => {
+      const b = verifyBatch(snap.rootHash, [keyAuth, keyNo, snap.keys.otherAuthorized, keyMissing], unionNodes);
+      a.equal(b.results.length, 4);
+      a.deepEqual(b.results.map((x) => x.result.status), ['authorized', 'unauthorized', 'authorized', 'invalid']);
+      const bad = b.results[3].result;
+      a.equal(bad.code, 'PATH_INCOMPLETE');
+      a.ok(bad.firstFailedLayer >= 2);
+      a.equal(b.results[0].result.firstFailedLayer, null);
+      // 失败路径仍保留中止前的已消费前缀与层证据，并只清除本条旧结论
+      a.equal(bad.consumedPath, keyMissing.slice(0, bad.consumedPath.length));
+      a.ok(bad.layers.length > 0);
+    });
+
+    test('聚合：共享根/共同前缀标出复用次数与对应指令', () => {
+      const b = verifyBatch(snap.rootHash, [keyAuth, keyNo, snap.keys.otherAuthorized], unionNodes);
+      // 根节点被全部 3 条路径消费
+      const rootShared = b.shared.find((s) => s.nodeHash === snap.rootHashHex);
+      a.ok(rootShared, '根应被标为共享节点');
+      a.equal(rootShared.reuseCount, 3);
+      a.deepEqual(rootShared.commands.sort(), [keyAuth, keyNo, snap.keys.otherAuthorized].sort());
+      // 深前缀族兄弟键共享更多节点（≥ 根以外的共同节点）
+      a.ok(b.shared.length >= 2, '深前缀扩展/分支共同节点也应被标出');
+      // 逐层标注：深键路径上至少一层出现共享徽记数据
+      const deep = b.results[0].result;
+      a.ok(deep.layers.some((l) => l.shared && l.shared.reuseCount >= 2));
+    });
+
+    test('聚合：内嵌节点不占池序号，其层不参与共享统计', () => {
+      const b = verifyBatch(snap.rootHash, [snap.keys.otherAuthorized], unionNodes);
+      const short = b.results[0].result;
+      const embedded = short.layers.filter((l) => l.reference === 'embedded-node');
+      a.ok(embedded.length >= 1, '短键路径含内嵌叶');
+      for (const l of embedded) a.equal(l.poolIndex, null);
+    });
+
+    test('聚合：未被任何目标路径消费的节点列为冗余证据', () => {
+      // 池里带 fedc 族独有节点，但不查询它
+      const b = verifyBatch(snap.rootHash, [keyAuth, snap.keys.otherAuthorized], unionNodes);
+      a.ok(b.redundant.length > 0);
+      const consumed = new Set();
+      for (const r of b.results) for (const i of r.result.reached) consumed.add(i);
+      for (const n of b.redundant) a.equal(consumed.has(n.poolIndex), false);
+    });
+
+    test('隔离：不可达的非规范 RLP 节点只进冗余清单，不污染任何结论', () => {
+      const pool = buildPool(unionNodes.concat([B('8100')])); // 非规范单字节，散列不被引用
+      const r = verifyFromPool(snap.rootHash, bytesToNibbles(fromHex(keyAuth)), pool);
+      a.equal(r.status, 'authorized');
+      const badEntry = pool.entries.find((e) => e.decodeError && e.decodeError.code === 'RLP_NONCANONICAL');
+      a.ok(badEntry);
+      a.ok(!r.reached.includes(badEntry.index));
+    });
+
+    test('隔离：共享节点被篡改只令经过它的指令失败，不经过的指令仍授权', () => {
+      const sample = buildBatchSample();
+      const nodes = sample.proofNodes.map((h) => Buffer.from(h, 'hex'));
+      // 深前缀族共享扩展节点 = 长键证明的第 2 个顺序节点；在池中按摘要定位并替换为篡改字节
+      const target = snap.proofFor(keyAuth)[1];
+      const targetHashHex = toHex(keccak256(target));
+      let hit = 0;
+      const tamperedPool = nodes.map((bytes) => {
+        if (toHex(keccak256(bytes)) === targetHashHex) {
+          hit += 1;
+          const b = Uint8Array.from(bytes);
+          b[b.length - 1] ^= 0x01;
+          return b;
+        }
+        return bytes;
+      });
+      a.equal(hit, 1, '示例池中应恰好含一个该共享节点');
+      const b = verifyBatch(snap.rootHash, [keyAuth, keyNo, snap.keys.otherAuthorized, keyMissing], tamperedPool);
+      a.deepEqual(b.results.map((x) => x.result.status), ['invalid', 'invalid', 'authorized', 'invalid']);
+      for (const i of [0, 1, 3]) a.equal(b.results[i].result.code, 'PATH_INCOMPLETE');
+    });
+
+    test('隔离：仅某条路径独有的末层缺失，只该条 PATH_INCOMPLETE', () => {
+      // fedc 前缀族拥有不与深前缀族共享的独有散列叶节点；只删它的最后一个证明节点。
+      const fedProof = snap.proofFor(keyFed);
+      a.ok(fedProof.length >= 2);
+      const leafHash = toHex(keccak256(fedProof.slice(-1)[0]));
+      const reduced = unionNodes.filter((n) => toHex(keccak256(n)) !== leafHash);
+      const b = verifyBatch(snap.rootHash, [keyAuth, keyFed], reduced);
+      a.equal(b.results[0].result.status, 'authorized');
+      a.equal(b.results[1].result.status, 'invalid');
+      a.equal(b.results[1].result.code, 'PATH_INCOMPLETE');
+    });
+
+    test('批量页面：汇总横幅、逐条结论、共享表、冗余清单与失败层', () => {
+      const b = verifyBatch(snap.rootHash, [keyAuth, keyNo, snap.keys.otherAuthorized, keyMissing], unionNodes);
+      const page = buildBatchPage(b, { rootHash: snap.rootHashHex, keyHexes: [keyAuth, keyNo, snap.keys.otherAuthorized, keyMissing] });
+      a.match(page, /<title>离线指令授权快照批量复核结果<\/title>/);
+      a.match(page, /批量复核完成：/);
+      a.match(page, /逐条结论与已消费路径/);
+      a.match(page, /共享节点复用统计/);
+      a.match(page, /冗余证据/);
+      a.match(page, /本条旧成功结论已清除/);
+      a.match(page, /PATH_INCOMPLETE/);
+      // 每条指令都出现
+      for (const k of [keyAuth, keyNo, keyMissing]) a.match(page, new RegExp(k));
+    });
+
+    test('API：多行标识与 JSON 数组标识均接受，返回 200 batch+page', () => {
+      const out1 = handleVerifyBatch({
+        rootHash: snap.rootHashHex,
+        keyHexes: [keyAuth, keyNo].join('\n'),
+        proofNodes: unionNodes.map((n) => toHex(n)),
+      });
+      a.equal(out1.httpStatus, 200);
+      a.equal(out1.batch.results.length, 2);
+      const out2 = handleVerifyBatch({
+        rootHash: snap.rootHashHex,
+        keyHexes: ['0x' + keyAuth, keyNo],
+        proofNodes: unionNodes.map((n) => toHex(n)),
+      });
+      a.equal(out2.httpStatus, 200);
+      a.match(out2.page, /批量复核完成/);
+    });
+
+    test('API：标识数量 2..8、去重、非法字符等输入校验', () => {
+      const nodes = unionNodes.map((n) => toHex(n));
+      a.equal(handleVerifyBatch({ rootHash: snap.rootHashHex, keyHexes: ['a2'], proofNodes: nodes }).httpStatus, 400);
+      a.match(handleVerifyBatch({ rootHash: snap.rootHashHex, keyHexes: ['a2'], proofNodes: nodes }).error, /2 至 8/);
+      a.match(handleVerifyBatch({ rootHash: snap.rootHashHex, keyHexes: ['a2', '0xa2', 'A2'], proofNodes: nodes }).error, /2 至 8/);
+      const nine = Array.from({ length: 9 }, (_, i) => '0' + i.toString(16));
+      a.match(handleVerifyBatch({ rootHash: snap.rootHashHex, keyHexes: nine, proofNodes: nodes }).error, /最多 8 条/);
+      a.match(handleVerifyBatch({ rootHash: snap.rootHashHex, keyHexes: ['a2', 'zz'], proofNodes: nodes }).error, /非十六进制/);
+      a.match(handleVerifyBatch({ rootHash: '0102', keyHexes: ['a2', 'a1'], proofNodes: nodes }).error, /32 字节/);
+      a.deepEqual(parseKeyHexes(['0xA2', 'a1', 'a2', ' ']), ['a2', 'a1']);
+    });
+
+    test('入口页含批量模式切换与批量示例入口', () => {
+      const html = buildIndexPage();
+      a.match(html, /批量复核/);
+      a.match(html, /id="keyHexes"/);
+      a.match(html, /\/api\/verify-batch/);
+      a.match(html, /load-batch/);
+    });
+
+    test('HTTP 冒烟：GET /api/sample-batch 提供去重无序池示例', async () => {
+      const res = await http('/api/sample-batch');
+      a.equal(res.status, 200);
+      const data = await res.json();
+      a.ok(data.keyHexes.length >= 2 && data.keyHexes.length <= 8);
+      a.ok(data.proofNodes.length >= 4);
+      // 示例故意重复粘贴了一个共同节点，去重发生在服务端（按 Keccak 摘要）
+      a.ok(data.proofNodes.length > new Set(data.proofNodes).size, '示例提交中含重复粘贴节点');
+    });
+
+    test('HTTP 冒烟：POST /api/verify-batch 逐条结论隔离且页面含共享/冗余章节', async () => {
+      const sample = buildBatchSample();
+      const res = await http('/api/verify-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rootHash: sample.rootHash, keyHexes: sample.keyHexes, proofNodes: sample.proofNodes.join('\n') }),
+      });
+      a.equal(res.status, 200);
+      const data = await res.json();
+      a.equal(data.batch.results.length, sample.keyHexes.length);
+      a.deepEqual(data.batch.results.map((x) => x.result.status), ['authorized', 'unauthorized', 'authorized', 'invalid']);
+      a.ok(data.batch.shared.some((s) => s.reuseCount >= 3));
+      a.ok(data.batch.redundant.length >= 1);
+      a.equal(data.batch.duplicateNodeCount, 1);
+      a.match(data.page, /共享节点复用统计/);
+      a.match(data.page, /冗余证据/);
+      a.match(data.page, /未被任何目标路径消费/);
     });
   });
 

@@ -116,6 +116,42 @@ async function main() {
     no.json.result.value === '00' && no.json.result.layers.length > 0);
   check('未授权页明确显示“未授权”', no.json.page.includes('未授权'));
 
+  // 批量复核：同快照多指令共享去重节点池
+  const batchSampleRes = await fetch(BASE + '/api/sample-batch');
+  check('批量示例：GET /api/sample-batch 返回 200', batchSampleRes.status === 200);
+  const batchSample = await batchSampleRes.json();
+  check('批量示例：含 2..8 条标识与去重无序节点池',
+    Array.isArray(batchSample.keyHexes) && batchSample.keyHexes.length >= 2 &&
+    batchSample.keyHexes.length <= 8 && Array.isArray(batchSample.proofNodes));
+
+  const batch = await postJson('/api/verify-batch', {
+    rootHash: batchSample.rootHash,
+    keyHexes: batchSample.keyHexes,
+    proofNodes: batchSample.proofNodes,
+  });
+  check('批量复核：HTTP 200 且逐条给出三类结论',
+    batch.status === 200 && batch.json.batch &&
+    batch.json.batch.results.some((r) => r.result.status === 'authorized') &&
+    batch.json.batch.results.some((r) => r.result.status === 'unauthorized') &&
+    batch.json.batch.results.some((r) => r.result.status === 'invalid'),
+    JSON.stringify((batch.json.batch || {}).results && batch.json.batch.results.map((r) => r.result.status)));
+  check('批量页：共享复用统计、冗余证据章节与单条失败隔离提示',
+    batch.json.page.includes('共享节点复用统计') &&
+    batch.json.page.includes('冗余证据') &&
+    batch.json.page.includes('本条旧成功结论已清除') &&
+    batch.json.page.includes('复用次数'));
+  check('批量复核：服务端按摘要去重并标出冗余节点',
+    batch.json.batch.duplicateNodeCount >= 1 &&
+    batch.json.batch.poolNodeCount < batch.json.batch.submittedNodeCount &&
+    batch.json.batch.redundant.length >= 1);
+
+  const batchBad = await postJson('/api/verify-batch', {
+    rootHash: batchSample.rootHash,
+    keyHexes: ['a2'], // 少于 2 条
+    proofNodes: batchSample.proofNodes,
+  });
+  check('批量复核：仅 1 条标识返回 400', batchBad.status === 400 && /2 至 8/.test(batchBad.json.error || ''));
+
   console.log(`\nHTTP 冒烟：${failures === 0 ? '全部通过 ✅' : failures + ' 项失败'}`);
   process.exitCode = failures === 0 ? 0 : 1;
 }

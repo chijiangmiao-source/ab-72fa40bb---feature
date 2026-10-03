@@ -38,4 +38,47 @@ function buildSnapshots() {
   };
 }
 
-module.exports = { buildSnapshots };
+// 批量复核示例：多指令共享一个去重节点池。
+//   - 0123456789abcdef0123 已授权（01）、……0124 未授权（00）：共享深前缀族共同节点；
+//   - a2 已授权（短键，经过内嵌叶）；
+//   - 0123456789abcdef0129 不存在：该条判无效（路径失败），同批其余结论不受影响；
+//   - 额外并入 fedc…abcd 证明的独有节点但不查询它：形成冗余证据；
+//   - 故意打乱池顺序并重复粘贴根节点，展示“无序提交 + 去重”。
+function buildBatchSample() {
+  const snap = buildSnapshots();
+  const queried = [
+    snap.keys.authorized,
+    snap.keys.unauthorized,
+    snap.keys.otherAuthorized,
+    '0123456789abcdef0129',
+  ];
+  const collected = [];
+  const addProof = (keyHex) => {
+    for (const node of snap.proofFor(keyHex)) collected.push(toHex(node));
+  };
+  queried.slice(0, 3).forEach(addProof);
+  addProof('fedcba9876543210abcd'); // 独有节点将成为冗余证据
+
+  const { keccak256 } = require('./keccak');
+  const unique = [];
+  const seen = new Set();
+  for (const hex of collected) {
+    const h = toHex(keccak256(Buffer.from(hex, 'hex')));
+    if (!seen.has(h)) {
+      seen.add(h);
+      unique.push(hex);
+    }
+  }
+  // 确定性乱序：整体右移三位，避免依赖随机数。
+  const shuffled = unique.slice(3).concat(unique.slice(0, 3));
+  // 重复粘贴一个共同节点（根），验证服务端去重。
+  shuffled.push(shuffled[0]);
+
+  return {
+    rootHash: snap.rootHashHex,
+    keyHexes: queried,
+    proofNodes: shuffled,
+  };
+}
+
+module.exports = { buildSnapshots, buildBatchSample };
